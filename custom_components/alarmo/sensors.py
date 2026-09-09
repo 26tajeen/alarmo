@@ -42,7 +42,7 @@ ATTR_ALLOW_OPEN = "allow_open"
 ATTR_TRIGGER_UNAVAILABLE = "trigger_unavailable"
 ATTR_AUTO_BYPASS = "auto_bypass"
 ATTR_AUTO_BYPASS_MODES = "auto_bypass_modes"
-ATTR_GROUP = "group"
+ATTR_GROUPS = "groups"
 ATTR_GROUP_ID = "group_id"
 ATTR_TIMEOUT = "timeout"
 ATTR_EVENT_COUNT = "event_count"
@@ -640,53 +640,60 @@ class SensorHandler:
         self.update_ready_to_arm_status(sensor_config["area"])
 
     def process_group_event(self, entity: str, state: str) -> dict:
-        """Check if sensor entity is member of a group to evaluate trigger."""
-        group_id = None
-        for group in self._groups.values():
-            if entity in group[ATTR_ENTITIES]:
-                group_id = group[ATTR_GROUP_ID]
-                break
+        """Check if sensor entity is member of any group(s) to evaluate trigger."""
+        matching_groups = [
+            group for group in self._groups.values() if entity in group[ATTR_ENTITIES]
+        ]
 
         open_sensors = {entity: state}
-        if group_id is None:
+        if not matching_groups:
             return open_sensors
 
-        group = self._groups[group_id]
-        group_events = (
-            self._group_events[group_id]
-            if group_id in self._group_events.keys()
-            else {}
-        )
         now = dt_util.now()
-        group_events[entity] = {ATTR_STATE: state, ATTR_LAST_TRIP_TIME: now}
-        self._group_events[group_id] = group_events
-        recent_events = {
-            entity: (now - event[ATTR_LAST_TRIP_TIME]).total_seconds()
-            for (entity, event) in group_events.items()
-        }
-        recent_events = dict(
-            filter(lambda el: el[1] <= group[ATTR_TIMEOUT], recent_events.items())
-        )
-        if len(recent_events.keys()) < group[ATTR_EVENT_COUNT]:
-            _LOGGER.debug(
-                "tripped sensor %s was ignored since it belongs to group %s",
-                entity,
-                group[ATTR_NAME],
+        triggered = False
+
+        # a sensor may belong to multiple groups (e.g. it corroborates both a
+        # neighbouring door sensor and a neighbouring motion sensor); each
+        # group tracks its own corroboration state independently, and a
+        # single trip can satisfy more than one group at once
+        for group in matching_groups:
+            group_id = group[ATTR_GROUP_ID]
+            group_events = (
+                self._group_events[group_id]
+                if group_id in self._group_events.keys()
+                else {}
             )
-            return {}
-        else:
+            group_events[entity] = {ATTR_STATE: state, ATTR_LAST_TRIP_TIME: now}
+            self._group_events[group_id] = group_events
+            recent_events = {
+                entity: (now - event[ATTR_LAST_TRIP_TIME]).total_seconds()
+                for (entity, event) in group_events.items()
+            }
+            recent_events = dict(
+                filter(lambda el: el[1] <= group[ATTR_TIMEOUT], recent_events.items())
+            )
+            if len(recent_events.keys()) < group[ATTR_EVENT_COUNT]:
+                _LOGGER.debug(
+                    "tripped sensor %s was ignored since it belongs to group %s",
+                    entity,
+                    group[ATTR_NAME],
+                )
+                continue
+
             # add all (recently) triggered sensors to open_sensors
             for entity_id in recent_events.keys():
                 open_sensors[entity_id] = group_events[entity_id][ATTR_STATE]
 
             # Add group info for override delay calculation
             open_sensors[ATTR_GROUP_ID] = group_id
+            triggered = True
             _LOGGER.debug(
                 "tripped sensor %s caused the triggering of group %s",
                 entity,
                 group[ATTR_NAME],
             )
-            return open_sensors
+
+        return open_sensors if triggered else {}
 
     def update_ready_to_arm_status(self, area_id):
         """Calculate whether the system is ready for arming."""
